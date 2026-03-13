@@ -452,8 +452,7 @@ const getDefaultSystemPrompt = (): string => {
   }
 
   try {
-    const promptPath = path.join(app.getAppPath(), 'sandbox', 'agent-runner', 'AGENT_SYSTEM_PROMPT.md');
-    cachedDefaultSystemPrompt = fs.readFileSync(promptPath, 'utf-8');
+    cachedDefaultSystemPrompt = '';
   } catch (error) {
     console.warn('Failed to load default system prompt:', error);
     cachedDefaultSystemPrompt = '';
