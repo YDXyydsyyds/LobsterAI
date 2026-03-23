@@ -1063,6 +1063,7 @@ const Settings: React.FC<SettingsProps> = ({ onClose, initialTab, notice, onUpda
         // Don't change API key or enabled state - keep them as is
       },
     }));
+  };
   const handleMiniMaxDeviceLogin = async (region: MiniMaxRegion) => {
     minimaxOAuthCancelRef.current = false;
     setMinimaxOAuthPhase({ kind: 'requesting_code' });
