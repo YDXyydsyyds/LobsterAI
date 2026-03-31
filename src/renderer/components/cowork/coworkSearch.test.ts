@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'vitest';
+import { describe, expect, test, vi } from 'vitest';
 import { getSnippet } from './CoworkSearchModal';
 
 // ---------------------------------------------------------------------------
@@ -111,5 +111,80 @@ describe('HighlightText split logic', () => {
 
   test('returns original text when keyword is empty string', () => {
     expect(splitByKeywords('hello', [''])).toEqual(['hello']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// countQueryInText — turn-level match counter used for highlight ring
+// ---------------------------------------------------------------------------
+import { countQueryInText } from './CoworkSessionDetail';
+
+describe('countQueryInText', () => {
+  test('returns 0 for empty query', () => {
+    expect(countQueryInText('hello world', '')).toBe(0);
+  });
+
+  test('returns 0 when query not found', () => {
+    expect(countQueryInText('hello world', 'xyz')).toBe(0);
+  });
+
+  test('counts single occurrence', () => {
+    expect(countQueryInText('hello world', 'world')).toBe(1);
+  });
+
+  test('counts multiple non-overlapping occurrences', () => {
+    expect(countQueryInText('cat and cat and cat', 'cat')).toBe(3);
+  });
+
+  test('is case-insensitive', () => {
+    expect(countQueryInText('YARN yarn Yarn', 'yarn')).toBe(3);
+  });
+
+  test('handles Chinese characters', () => {
+    expect(countQueryInText('阿里云 腾讯云 阿里云', '阿里云')).toBe(2);
+  });
+
+  test('does not double-count overlapping matches', () => {
+    // 'aa' in 'aaa' should match twice: pos 0 and pos 1
+    // but our impl advances by q.length so only pos 0 counts → 1 match
+    expect(countQueryInText('aaa', 'aa')).toBe(1);
+  });
+
+  test('returns 0 for empty text', () => {
+    expect(countQueryInText('', 'keyword')).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// scrollToMatchNode — boundary guards (DOM-free subset)
+// ---------------------------------------------------------------------------
+import { scrollToMatchNode } from './CoworkSessionDetail';
+
+describe('scrollToMatchNode boundary guards', () => {
+  /** Build a minimal Text node stub for testing boundary logic. */
+  function makeTextNode(content: string): Text {
+    return { textContent: content } as unknown as Text;
+  }
+
+  test('does nothing when container is null', () => {
+    // Should not throw
+    expect(() =>
+      scrollToMatchNode({ node: makeTextNode('hello'), start: 0 }, 5, null)
+    ).not.toThrow();
+  });
+
+  test('does nothing when queryLen is 0', () => {
+    const scrollTo = vi.fn();
+    const container = { scrollTo, scrollTop: 0, getBoundingClientRect: () => ({ top: 0 }) } as unknown as HTMLDivElement;
+    scrollToMatchNode({ node: makeTextNode('hello'), start: 0 }, 0, container);
+    expect(scrollTo).not.toHaveBeenCalled();
+  });
+
+  test('does nothing when start + queryLen exceeds node length (stale node guard)', () => {
+    // node has 5 chars, but we claim offset 3 with len 5 → 3+5=8 > 5, should skip
+    const scrollTo = vi.fn();
+    const container = { scrollTo, scrollTop: 0, getBoundingClientRect: () => ({ top: 0 }) } as unknown as HTMLDivElement;
+    scrollToMatchNode({ node: makeTextNode('hello'), start: 3 }, 5, container);
+    expect(scrollTo).not.toHaveBeenCalled();
   });
 });
