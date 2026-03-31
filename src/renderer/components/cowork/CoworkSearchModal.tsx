@@ -33,7 +33,7 @@ interface CoworkSearchModalProps {
  * Extract a short snippet around the first occurrence of any term in `text`.
  * Window: up to 30 chars before + term itself + 60 chars after.
  */
-const getSnippet = (text: string, terms: string[], maxLen = 120): string => {
+export const getSnippet = (text: string, terms: string[], maxLen = 120): string => {
   if (!text || terms.length === 0) return text.slice(0, maxLen);
   const lower = text.toLowerCase();
   let bestIdx = -1;

@@ -65,6 +65,32 @@ function normalizeMemoryText(value: string): string {
   return value.replace(/\s+/g, ' ').trim();
 }
 
+/**
+ * Extract a snippet from `content` centred around the first occurrence of any
+ * of the `searchTerms`. Window: up to 60 chars before + term + 60 chars after.
+ * Exported for unit testing.
+ */
+export function extractSnippet(content: string, searchTerms: string[]): string {
+  const normalised = content.replace(/\s+/g, ' ').trim();
+  if (!normalised) return '';
+  const lower = normalised.toLowerCase();
+  let bestIdx = -1;
+  let bestTerm = '';
+  for (const term of searchTerms) {
+    if (!term.trim()) continue;
+    const idx = lower.indexOf(term.toLowerCase());
+    if (idx !== -1 && (bestIdx === -1 || idx < bestIdx)) {
+      bestIdx = idx;
+      bestTerm = term;
+    }
+  }
+  if (bestIdx === -1) return normalised.slice(0, 200);
+  const start = Math.max(0, bestIdx - 60);
+  const end = Math.min(normalised.length, bestIdx + bestTerm.length + 60);
+  const raw = normalised.slice(start, end);
+  return `${start > 0 ? '…' : ''}${raw}${end < normalised.length ? '…' : ''}`;
+}
+
 function extractConversationSearchTerms(value: string): string[] {
   const normalized = normalizeMemoryText(value).toLowerCase();
   if (!normalized) return [];
@@ -1604,29 +1630,6 @@ export class CoworkStore {
       ORDER BY m.created_at DESC
       LIMIT ?
     `, [...params, maxResults * 40]);
-
-    // Extract a snippet centred around the first occurrence of any search term,
-    // so that the keyword is always visible in the result preview.
-    const extractSnippet = (content: string, searchTerms: string[]): string => {
-      const normalised = content.replace(/\s+/g, ' ').trim();
-      const lower = normalised.toLowerCase();
-      let bestIdx = -1;
-      let bestTerm = '';
-      for (const term of searchTerms) {
-        const idx = lower.indexOf(term.toLowerCase());
-        if (idx !== -1 && (bestIdx === -1 || idx < bestIdx)) {
-          bestIdx = idx;
-          bestTerm = term;
-        }
-      }
-      if (bestIdx === -1) return truncate(normalised, 200);
-      // Window: up to 60 chars before the match, keyword to its end, then 60 chars of context after.
-      // Mirrors the frontend getSnippet logic: start=idx-30, end=idx+keyword.length+60.
-      const start = Math.max(0, bestIdx - 60);
-      const end = Math.min(normalised.length, bestIdx + bestTerm.length + 60);
-      const raw = normalised.slice(start, end);
-      return `${start > 0 ? '…' : ''}${raw}${end < normalised.length ? '…' : ''}`;
-    };
 
     const bySession = new Map<string, CoworkConversationSearchRecord>();
     for (const row of rows) {
