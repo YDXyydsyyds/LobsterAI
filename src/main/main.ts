@@ -18,7 +18,7 @@ import type { PermissionResult } from '@anthropic-ai/claude-agent-sdk';
 import { getCurrentApiConfig, resolveCurrentApiConfig, setStoreGetter, setAuthTokensGetter, setServerBaseUrlGetter, updateServerModelMetadata, clearServerModelMetadata } from './libs/claudeSettings';
 import { saveCoworkApiConfig } from './libs/coworkConfigStore';
 import { generateSessionTitle, probeCoworkModelReadiness } from './libs/coworkUtil';
-import { startCoworkOpenAICompatProxy, stopCoworkOpenAICompatProxy, setProxyTokenRefresher } from './libs/coworkOpenAICompatProxy';
+import { startCoworkOpenAICompatProxy, stopCoworkOpenAICompatProxy, registerProxyTokenRefresher } from './libs/coworkOpenAICompatProxy';
 import { startOpenClawTokenProxy, stopOpenClawTokenProxy } from './libs/openclawTokenProxy';
 import { OpenClawEngineManager, type OpenClawEngineStatus } from './libs/openclawEngineManager';
 import {
@@ -28,6 +28,12 @@ import {
   readAllowFromStore,
 } from './im/imPairingStore';
 import { OpenClawConfigSync } from './libs/openclawConfigSync';
+import {
+  initCopilotTokenManager,
+  setCopilotTokenState,
+  clearCopilotTokenState,
+  refreshCopilotTokenNow,
+} from './libs/copilotTokenManager';
 import {
   resolveMemoryFilePath,
   readMemoryEntries,
@@ -777,25 +783,25 @@ const getOpenClawConfigSync = (): OpenClawConfigSync => {
           return null;
         }
       },
-      getDingTalkConfig: () => {
+      getDingTalkInstances: () => {
         try {
-          return getIMGatewayManager().getConfig().dingtalk;
+          return getIMGatewayManager().getIMStore().getDingTalkInstances();
         } catch {
-          return null;
+          return [];
         }
       },
-      getFeishuConfig: () => {
+      getFeishuInstances: () => {
         try {
-          return getIMGatewayManager().getConfig().feishu;
+          return getIMGatewayManager().getIMStore().getFeishuInstances();
         } catch {
-          return null;
+          return [];
         }
       },
-      getQQConfig: () => {
+      getQQInstances: () => {
         try {
-          return getIMGatewayManager().getConfig().qq;
+          return getIMGatewayManager().getIMStore().getQQInstances();
         } catch {
-          return null;
+          return [];
         }
       },
       getWecomConfig: () => {
@@ -918,6 +924,7 @@ const scheduleDeferredGatewayRestart = (reason: string) => {
 const syncOpenClawConfig = async (
   options: { reason: string; restartGatewayIfRunning?: boolean } = { reason: 'unknown' },
 ): Promise<{ success: boolean; changed: boolean; status?: OpenClawEngineStatus; error?: string }> => {
+  console.log(`[OpenClaw] syncOpenClawConfig: called (reason: ${options.reason}, restart gateway if running: ${options.restartGatewayIfRunning ? 'yes' : 'no'})`);
   // When the gateway is running and there are active workloads (cowork
   // sessions OR running cron jobs), defer the entire sync — including the
   // config file write — to avoid triggering OpenClaw's built-in file-watcher
@@ -1493,7 +1500,7 @@ function mergeCoworkSystemPrompt(
 }
 
 // 获取正确的预加载脚本路径
-const PRELOAD_PATH = app.isPackaged 
+const PRELOAD_PATH = app.isPackaged
   ? path.join(__dirname, 'preload.js')
   : path.join(__dirname, '../dist-electron/preload.js');
 
@@ -2598,6 +2605,7 @@ if (!gotTheLock) {
 
   ipcMain.handle('cowork:session:delete', async (_event, sessionId: string) => {
     try {
+      getCoworkEngineRouter().stopSession(sessionId);
       const coworkStoreInstance = getCoworkStore();
       coworkStoreInstance.deleteSession(sessionId);
       // Clean up IM session mapping so that new channel messages
@@ -2625,6 +2633,10 @@ if (!gotTheLock) {
 
   ipcMain.handle('cowork:session:deleteBatch', async (_event, sessionIds: string[]) => {
     try {
+      const runtime = getCoworkEngineRouter();
+      sessionIds.forEach((sessionId) => {
+        runtime.stopSession(sessionId);
+      });
       const coworkStoreInstance = getCoworkStore();
       coworkStoreInstance.deleteSessions(sessionIds);
       const router = getCoworkEngineRouter();
@@ -2888,6 +2900,47 @@ if (!gotTheLock) {
       return {
         success: false,
         error: error instanceof Error ? error.message : 'Failed to save session image',
+      };
+    }
+  });
+
+  ipcMain.handle('cowork:session:exportText', async (
+    event,
+    options: {
+      content: string;
+      defaultFileName?: string;
+      fileExtension?: string;
+    }
+  ) => {
+    try {
+      const content = typeof options?.content === 'string' ? options.content : '';
+      if (!content) {
+        return { success: false, error: 'Export content is empty' };
+      }
+
+      const ext = options?.fileExtension || 'md';
+      const filterName = ext === 'json' ? 'JSON' : 'Markdown';
+      const defaultName = options?.defaultFileName || `session-export.${ext}`;
+      const ownerWindow = BrowserWindow.fromWebContents(event.sender);
+      const saveOptions = {
+        title: 'Export Session',
+        defaultPath: path.join(app.getPath('downloads'), defaultName),
+        filters: [{ name: filterName, extensions: [ext] }],
+      };
+      const saveResult = ownerWindow
+        ? await dialog.showSaveDialog(ownerWindow, saveOptions)
+        : await dialog.showSaveDialog(saveOptions);
+
+      if (saveResult.canceled || !saveResult.filePath) {
+        return { success: true, canceled: true };
+      }
+
+      await fs.promises.writeFile(saveResult.filePath, content, 'utf-8');
+      return { success: true, canceled: false, path: saveResult.filePath };
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to export session',
       };
     }
   });
@@ -3219,7 +3272,7 @@ if (!gotTheLock) {
   ipcMain.handle('permissions:checkCalendar', async () => {
     try {
       const status = await checkCalendarPermission();
-      
+
       // Development mode: Auto-request permission if not determined
       // This provides a better dev experience without affecting production
       if (isDev && status === 'not-determined' && process.platform === 'darwin') {
@@ -3233,7 +3286,7 @@ if (!gotTheLock) {
           console.warn('[Permissions] Development mode: Auto-request failed:', requestError);
         }
       }
-      
+
       return { success: true, status };
     } catch (error) {
       console.error('[Main] Error checking calendar permission:', error);
@@ -3520,6 +3573,156 @@ if (!gotTheLock) {
     }
   });
 
+  // DingTalk Multi-Instance handlers
+  ipcMain.handle('im:dingtalk:instance:add', async (_event, name: string) => {
+    try {
+      const instanceId = crypto.randomUUID();
+      const { DEFAULT_DINGTALK_OPENCLAW_CONFIG: defaults } = await import('./im/types');
+      const instance = {
+        ...defaults,
+        instanceId,
+        instanceName: name || 'DingTalk Bot',
+      };
+      getIMGatewayManager().getIMStore().setDingTalkInstanceConfig(instanceId, instance);
+      return { success: true, instance };
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to add DingTalk instance',
+      };
+    }
+  });
+
+  ipcMain.handle('im:dingtalk:instance:delete', async (_event, instanceId: string) => {
+    try {
+      getIMGatewayManager().getIMStore().deleteDingTalkInstance(instanceId);
+      if (getOpenClawEngineManager().getStatus().phase === 'running') {
+        scheduleImConfigSync();
+      }
+      return { success: true };
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to delete DingTalk instance',
+      };
+    }
+  });
+
+  ipcMain.handle('im:dingtalk:instance:config:set', async (_event, instanceId: string, config: any, options?: { syncGateway?: boolean }) => {
+    try {
+      getIMGatewayManager().getIMStore().setDingTalkInstanceConfig(instanceId, config);
+      if (options?.syncGateway && getOpenClawEngineManager().getStatus().phase === 'running') {
+        scheduleImConfigSync();
+      }
+      return { success: true };
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to set DingTalk instance config',
+      };
+    }
+  });
+
+  // QQ Multi-Instance handlers
+  ipcMain.handle('im:qq:instance:add', async (_event, name: string) => {
+    try {
+      const instanceId = crypto.randomUUID();
+      const { DEFAULT_QQ_CONFIG: defaults } = await import('./im/types');
+      const instance = {
+        ...defaults,
+        instanceId,
+        instanceName: name || 'QQ Bot',
+      };
+      getIMGatewayManager().getIMStore().setQQInstanceConfig(instanceId, instance);
+      return { success: true, instance };
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to add QQ instance',
+      };
+    }
+  });
+
+  ipcMain.handle('im:qq:instance:delete', async (_event, instanceId: string) => {
+    try {
+      getIMGatewayManager().getIMStore().deleteQQInstance(instanceId);
+      if (getOpenClawEngineManager().getStatus().phase === 'running') {
+        scheduleImConfigSync();
+      }
+      return { success: true };
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to delete QQ instance',
+      };
+    }
+  });
+
+  ipcMain.handle('im:qq:instance:config:set', async (_event, instanceId: string, config: any, options?: { syncGateway?: boolean }) => {
+    try {
+      getIMGatewayManager().getIMStore().setQQInstanceConfig(instanceId, config);
+      if (options?.syncGateway && getOpenClawEngineManager().getStatus().phase === 'running') {
+        scheduleImConfigSync();
+      }
+      return { success: true };
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to set QQ instance config',
+      };
+    }
+  });
+
+  // Feishu Multi-Instance handlers
+  ipcMain.handle('im:feishu:instance:add', async (_event, name: string) => {
+    try {
+      const instanceId = crypto.randomUUID();
+      const { DEFAULT_FEISHU_OPENCLAW_CONFIG: defaults } = await import('./im/types');
+      const instance = {
+        ...defaults,
+        instanceId,
+        instanceName: name || 'Feishu Bot',
+      };
+      getIMGatewayManager().getIMStore().setFeishuInstanceConfig(instanceId, instance);
+      return { success: true, instance };
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to add Feishu instance',
+      };
+    }
+  });
+
+  ipcMain.handle('im:feishu:instance:delete', async (_event, instanceId: string) => {
+    try {
+      getIMGatewayManager().getIMStore().deleteFeishuInstance(instanceId);
+      if (getOpenClawEngineManager().getStatus().phase === 'running') {
+        scheduleImConfigSync();
+      }
+      return { success: true };
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to delete Feishu instance',
+      };
+    }
+  });
+
+  ipcMain.handle('im:feishu:instance:config:set', async (_event, instanceId: string, config: any, options?: { syncGateway?: boolean }) => {
+    try {
+      getIMGatewayManager().getIMStore().setFeishuInstanceConfig(instanceId, config);
+      if (options?.syncGateway && getOpenClawEngineManager().getStatus().phase === 'running') {
+        scheduleImConfigSync();
+      }
+      return { success: true };
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to set Feishu instance config',
+      };
+    }
+  });
+
   // Feishu bot install helpers
   ipcMain.handle('feishu:install:qrcode', async (_event, { isLark }: { isLark: boolean }) => {
     try {
@@ -3542,6 +3745,58 @@ if (!gotTheLock) {
       return await getIMGatewayManager().verifyFeishuCredentials(appId, appSecret);
     } catch (error) {
       return { success: false, error: error instanceof Error ? error.message : '验证失败' };
+    }
+  });
+
+  // GitHub Copilot device code authentication handlers
+  ipcMain.handle('github-copilot:request-device-code', async () => {
+    const { requestDeviceCode } = await import('./libs/githubCopilotAuth');
+    try {
+      const result = await requestDeviceCode();
+      return {
+        userCode: result.user_code,
+        verificationUri: result.verification_uri,
+        deviceCode: result.device_code,
+        interval: result.interval,
+        expiresIn: result.expires_in,
+      };
+    } catch (error) {
+      throw new Error(error instanceof Error ? error.message : 'Failed to request device code');
+    }
+  });
+
+  ipcMain.handle('github-copilot:poll-for-token', async (_event, { deviceCode, interval, expiresIn }: { deviceCode: string; interval: number; expiresIn: number }) => {
+    const { pollForAccessToken, getCopilotToken, getGitHubUser } = await import('./libs/githubCopilotAuth');
+    try {
+      const githubAccessToken = await pollForAccessToken(deviceCode, interval, expiresIn);
+      const githubUser = await getGitHubUser(githubAccessToken);
+      const { token: copilotToken, expiresAt, baseUrl } = await getCopilotToken(githubAccessToken);
+      // Store the GitHub access token for later token refresh
+      getStore().set('github_copilot_github_token', githubAccessToken);
+      // Register with the token manager for automatic refresh
+      setCopilotTokenState({ copilotToken, baseUrl, expiresAt, githubToken: githubAccessToken });
+      return { success: true, token: copilotToken, githubUser, baseUrl };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Authentication failed' };
+    }
+  });
+
+  ipcMain.handle('github-copilot:cancel-polling', async () => {
+    const { cancelPolling } = await import('./libs/githubCopilotAuth');
+    cancelPolling();
+  });
+
+  ipcMain.handle('github-copilot:sign-out', async () => {
+    getStore().delete('github_copilot_github_token');
+    clearCopilotTokenState();
+  });
+
+  ipcMain.handle('github-copilot:refresh-token', async () => {
+    try {
+      const state = await refreshCopilotTokenNow();
+      return { success: true, token: state.copilotToken, baseUrl: state.baseUrl };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Token refresh failed' };
     }
   });
 
@@ -3789,6 +4044,23 @@ if (!gotTheLock) {
     }
   });
 
+  // Helper: detect if a URL belongs to GitHub Copilot and apply token refresh on 401.
+  const isCopilotUrl = (url: string) =>
+    url.includes('githubcopilot.com');
+  const retryCopilotWithRefreshedToken = async (
+    opts: { url: string; method: string; headers: Record<string, string>; body?: string },
+  ): Promise<{ headers: Record<string, string>; retried: boolean }> => {
+    try {
+      const state = await refreshCopilotTokenNow();
+      const refreshedHeaders = { ...opts.headers, Authorization: `Bearer ${state.copilotToken}` };
+      console.log('[CopilotRetry] token refreshed, retrying request');
+      return { headers: refreshedHeaders, retried: true };
+    } catch (err) {
+      console.warn('[CopilotRetry] token refresh failed, not retrying:', err);
+      return { headers: opts.headers, retried: false };
+    }
+  };
+
   // API 代理处理程序 - 解决 CORS 问题
   ipcMain.handle('api:fetch', async (_event, options: {
     url: string;
@@ -3796,11 +4068,12 @@ if (!gotTheLock) {
     headers: Record<string, string>;
     body?: string;
   }) => {
-    console.log(`[api:fetch] ${options.method} ${options.url}`);
-    try {
+    console.log(`[api:fetch] ${options.method} ${options.url}, headers: ${JSON.stringify(options.headers)}, body: ${options.body}`);
+
+    const doFetch = async (headers: Record<string, string>) => {
       const response = await session.defaultSession.fetch(options.url, {
         method: options.method,
-        headers: options.headers,
+        headers,
         body: options.body,
       });
 
@@ -3808,7 +4081,6 @@ if (!gotTheLock) {
       let data: string | object;
 
       if (contentType.includes('text/event-stream')) {
-        // SSE 流式响应，返回完整的文本
         data = await response.text();
       } else if (contentType.includes('application/json')) {
         data = await response.json();
@@ -3816,14 +4088,29 @@ if (!gotTheLock) {
         data = await response.text();
       }
 
-      const result = {
+      return {
         ok: response.ok,
         status: response.status,
         statusText: response.statusText,
         headers: Object.fromEntries(response.headers.entries()),
         data,
       };
-      console.log(`[api:fetch] ${options.method} ${options.url} -> ${response.status} ${response.statusText}`, typeof data === 'object' ? JSON.stringify(data) : data);
+    };
+
+    try {
+      let result = await doFetch(options.headers);
+      console.log(`[api:fetch] ${options.method} ${options.url} -> ${result.status} ${result.statusText}`, typeof result.data === 'object' ? JSON.stringify(result.data) : result.data);
+
+      // Auto-retry once for Copilot 401/403
+      if (!result.ok && (result.status === 401 || result.status === 403) && isCopilotUrl(options.url)) {
+        console.log('[api:fetch] Copilot auth error, attempting token refresh and retry');
+        const { headers: refreshedHeaders, retried } = await retryCopilotWithRefreshedToken(options);
+        if (retried) {
+          result = await doFetch(refreshedHeaders);
+          console.log(`[api:fetch] retry -> ${result.status} ${result.statusText}`);
+        }
+      }
+
       return result;
     } catch (error) {
       console.error(`[api:fetch] ${options.method} ${options.url} -> ERROR:`, error instanceof Error ? error.message : error);
@@ -3852,12 +4139,27 @@ if (!gotTheLock) {
     activeStreamControllers.set(options.requestId, controller);
 
     try {
-      const response = await session.defaultSession.fetch(options.url, {
+      let response = await session.defaultSession.fetch(options.url, {
         method: options.method,
         headers: options.headers,
         body: options.body,
         signal: controller.signal,
       });
+
+      // Auto-retry once for Copilot 401/403
+      if (!response.ok && (response.status === 401 || response.status === 403) && isCopilotUrl(options.url)) {
+        console.log('[api:stream] Copilot auth error, attempting token refresh and retry');
+        const { headers: refreshedHeaders, retried } = await retryCopilotWithRefreshedToken(options);
+        if (retried) {
+          response = await session.defaultSession.fetch(options.url, {
+            method: options.method,
+            headers: refreshedHeaders,
+            body: options.body,
+            signal: controller.signal,
+          });
+          console.log(`[api:stream] retry -> ${response.status} ${response.statusText}`);
+        }
+      }
 
       if (!response.ok) {
         const errorData = await response.text();
@@ -3934,6 +4236,53 @@ if (!gotTheLock) {
       return true;
     }
     return false;
+  });
+
+  // Qwen OAuth 登录
+  ipcMain.handle('qwen:oauth:login', async (event) => {
+    const { startQwenOAuth } = await import('./libs/qwenOAuth');
+
+    const progressCallback = {
+      update: (message: string) => {
+        event.sender.send('qwen:oauth:progress', message);
+      },
+      stop: (message?: string) => {
+        if (message) {
+          event.sender.send('qwen:oauth:progress', message);
+        }
+      }
+    };
+
+    try {
+      const oauthToken = await startQwenOAuth(progressCallback);
+      return {
+        success: true,
+        data: oauthToken
+      };
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'OAuth login failed'
+      };
+    }
+  });
+
+  // Qwen OAuth 刷新 token
+  ipcMain.handle('qwen:oauth:refresh', async (_event, refreshToken: string) => {
+    const { refreshQwenOAuthToken } = await import('./libs/qwenOAuth');
+
+    try {
+      const oauthToken = await refreshQwenOAuthToken(refreshToken);
+      return {
+        success: true,
+        data: oauthToken
+      };
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Token refresh failed'
+      };
+    }
   });
 
   // 企微 SDK 授权弹窗白名单域名
@@ -4123,7 +4472,7 @@ if (!gotTheLock) {
         mainWindow?.loadURL(DEV_SERVER_URL).catch((err) => {
           console.error('Failed to load URL:', err);
           retryCount++;
-          
+
           if (retryCount < maxRetries) {
             console.log(`Retrying to load URL (${retryCount}/${maxRetries})...`);
             setTimeout(tryLoadURL, 3000);
@@ -4137,7 +4486,7 @@ if (!gotTheLock) {
       };
 
       tryLoadURL();
-      
+
       // 打开开发者工具
       mainWindow.webContents.openDevTools();
     } else {
@@ -4400,10 +4749,54 @@ if (!gotTheLock) {
     });
     setServerBaseUrlGetter(() => getServerApiBaseUrl());
 
-    // Wire up token refresher for the OpenAI compat proxy so it can retry
-    // on 401/403 with a fresh accessToken instead of failing immediately.
-    // Delegates to the shared refreshOnce() to avoid concurrent refresh races.
-    setProxyTokenRefresher(() => refreshOnce('proxy'));
+    // Initialize Copilot token manager and restore token state if available
+    initCopilotTokenManager(getStore);
+    const storedGithubToken = getStore().get('github_copilot_github_token') as string | undefined;
+    if (storedGithubToken) {
+      import('./libs/githubCopilotAuth').then(({ getCopilotToken }) =>
+        getCopilotToken(storedGithubToken).then(({ token, expiresAt, baseUrl }) => {
+          setCopilotTokenState({ copilotToken: token, baseUrl, expiresAt, githubToken: storedGithubToken });
+          console.log('[Main] restored Copilot token state from stored GitHub token');
+        })
+      ).catch((err) => {
+        console.warn('[Main] failed to restore Copilot token on startup:', err);
+      });
+    }
+
+    registerProxyTokenRefresher('lobsterai-server', async () => {
+      const tokens = getAuthTokens();
+      if (!tokens?.refreshToken) return null;
+      const serverBaseUrl = getServerApiBaseUrl();
+      try {
+        const resp = await net.fetch(`${serverBaseUrl}/api/auth/refresh`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ refreshToken: tokens.refreshToken }),
+        });
+        if (resp.ok) {
+          const body = await resp.json() as { code: number; data: { accessToken: string; refreshToken?: string } };
+          if (body.code === 0 && body.data) {
+            saveAuthTokens(body.data.accessToken, body.data.refreshToken || tokens.refreshToken);
+            console.log('[Auth] proxy token refresh succeeded');
+            return body.data.accessToken;
+          }
+        }
+      } catch (err) {
+        console.warn('[Auth] proxy token refresh failed:', err);
+      }
+      return null;
+    });
+
+    registerProxyTokenRefresher('github-copilot', async () => {
+      try {
+        const { refreshCopilotTokenNow } = await import('./libs/copilotTokenManager');
+        const refreshed = await refreshCopilotTokenNow();
+        return refreshed.copilotToken;
+      } catch (err) {
+        console.warn('[Auth] Copilot proxy token refresh failed:', err);
+        return null;
+      }
+    });
 
     // Start the lightweight token proxy before OpenClaw config sync so that
     // lobsterai-server provider can use the proxy URL in its config.
@@ -4568,6 +4961,18 @@ if (!gotTheLock) {
       console.error('Failed to start OpenAI compatibility proxy:', error);
     });
 
+    // Re-sync OpenClaw config after proxy is ready so that providers that route
+    // through the proxy (e.g. github-copilot) get the correct baseUrl.
+    if (resolveCoworkAgentEngine() === 'openclaw') {
+      const proxyResync = await syncOpenClawConfig({
+        reason: 'proxy-ready',
+        restartGatewayIfRunning: true,
+      });
+      if (proxyResync.changed) {
+        console.log('[Main] OpenClaw config updated after proxy ready, gateway will restart to pick up new config');
+      }
+    }
+
     // 设置安全策略
     setContentSecurityPolicy();
 
@@ -4670,4 +5075,4 @@ if (!gotTheLock) {
       app.quit();
     }
   });
-} 
+}
