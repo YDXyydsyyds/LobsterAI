@@ -146,7 +146,7 @@ const CoworkPromptInput = React.forwardRef<CoworkPromptInputRef, CoworkPromptInp
         isImage: true,
         dataUrl: `data:${img.mimeType};base64,${img.base64Data}`,
       }));
-      setAttachments(newAttachments);
+      dispatch(setDraftAttachments({ draftKey, attachments: newAttachments }));
     },
     focus: () => {
       textareaRef.current?.focus();
