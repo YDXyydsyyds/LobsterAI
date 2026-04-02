@@ -2596,6 +2596,17 @@ if (!gotTheLock) {
     }
   });
 
+  ipcMain.handle('cowork:message:deleteFrom', async (_event, { sessionId, messageId }: { sessionId: string; messageId: string }) => {
+    try {
+      const coworkStoreInstance = getCoworkStore();
+      const deleted = coworkStoreInstance.deleteMessageAndAfter(sessionId, messageId);
+      return { success: true, deleted };
+    } catch (err) {
+      console.error('[cowork] deleteMessageAndAfter failed:', err);
+      return { success: false, error: String(err) };
+    }
+  });
+
   ipcMain.handle('cowork:session:delete', async (_event, sessionId: string) => {
     try {
       const coworkStoreInstance = getCoworkStore();

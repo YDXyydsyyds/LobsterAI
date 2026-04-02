@@ -5,12 +5,13 @@ import { RootState } from '../../store';
 import { i18nService } from '../../services/i18n';
 import type { CoworkMessage, CoworkMessageMetadata, CoworkImageAttachment } from '../../types/cowork';
 import type { Skill } from '../../types/skill';
-import CoworkPromptInput from './CoworkPromptInput';
+import CoworkPromptInput, { type CoworkPromptInputRef } from './CoworkPromptInput';
 import MarkdownContent from '../MarkdownContent';
 import {
   CheckIcon,
   ChevronRightIcon,
   PhotoIcon,
+  ArrowPathIcon,
 } from '@heroicons/react/24/outline';
 import { ShareIcon } from '@heroicons/react/20/solid';
 import InformationCircleIcon from '../icons/InformationCircleIcon';
@@ -931,7 +932,12 @@ const CopyButton: React.FC<{
   );
 };
 
-export const UserMessageItem: React.FC<{ message: CoworkMessage; skills: Skill[] }> = React.memo(({ message, skills }) => {
+export const UserMessageItem: React.FC<{
+  message: CoworkMessage;
+  skills: Skill[];
+  isLastTurn?: boolean;
+  onEdit?: (message: CoworkMessage) => void;
+}> = React.memo(({ message, skills, isLastTurn = false, onEdit }) => {
   const [isHovered, setIsHovered] = useState(false);
   const [expandedImage, setExpandedImage] = useState<string | null>(null);
 
@@ -994,6 +1000,16 @@ export const UserMessageItem: React.FC<{ message: CoworkMessage; skills: Skill[]
                     </span>
                   </div>
                 ))}
+                {isLastTurn && (
+                  <button
+                    type="button"
+                    title={i18nService.t('editMessage')}
+                    className={`p-1.5 rounded-lg text-secondary hover:bg-surface-raised transition-colors ${isHovered ? 'opacity-100' : 'opacity-0 pointer-events-none'}`}
+                    onClick={() => onEdit?.(message)}
+                  >
+                    <PencilSquareIcon className="h-4 w-4" />
+                  </button>
+                )}
                 <CopyButton
                   content={message.content}
                   visible={isHovered}
@@ -1026,11 +1042,15 @@ const AssistantMessageItem: React.FC<{
   resolveLocalFilePath?: (href: string, text: string) => string | null;
   mapDisplayText?: (value: string) => string;
   showCopyButton?: boolean;
+  showResendButton?: boolean;
+  onResend?: () => void;
 }> = ({
   message,
   resolveLocalFilePath,
   mapDisplayText,
   showCopyButton = false,
+  showResendButton = false,
+  onResend,
 }) => {
   const [isHovered, setIsHovered] = useState(false);
   const displayContent = mapDisplayText ? mapDisplayText(message.content) : message.content;
@@ -1049,12 +1069,24 @@ const AssistantMessageItem: React.FC<{
           showRevealInFolderAction
         />
       </div>
-      {showCopyButton && (
+      {(showCopyButton || showResendButton) && (
         <div className="flex items-center gap-1.5 mt-1">
-          <CopyButton
-            content={displayContent}
-            visible={isHovered}
-          />
+          {showCopyButton && (
+            <CopyButton
+              content={displayContent}
+              visible={isHovered}
+            />
+          )}
+          {showResendButton && onResend && (
+            <button
+              type="button"
+              title={i18nService.t('resendMessage')}
+              onClick={onResend}
+              className={`p-1 rounded-md text-secondary hover:text-foreground hover:bg-surface-raised transition-colors ${isHovered ? 'opacity-100' : 'opacity-0'}`}
+            >
+              <ArrowPathIcon className="h-4 w-4" />
+            </button>
+          )}
         </div>
       )}
     </div>
@@ -1164,12 +1196,16 @@ export const AssistantTurnBlock: React.FC<{
   mapDisplayText?: (value: string) => string;
   showTypingIndicator?: boolean;
   showCopyButtons?: boolean;
+  isLastTurn?: boolean;
+  onResend?: () => void;
 }> = ({
   turn,
   resolveLocalFilePath,
   mapDisplayText,
   showTypingIndicator = false,
   showCopyButtons = true,
+  isLastTurn = false,
+  onResend,
 }) => {
   const visibleAssistantItems = getVisibleAssistantItems(turn.assistantItems);
 
@@ -1270,6 +1306,10 @@ export const AssistantTurnBlock: React.FC<{
                   .slice(index + 1)
                   .some(laterItem => laterItem.type === 'tool_group');
 
+                // Show resend button on the last assistant message of the last turn
+                const isLastAssistant = !visibleAssistantItems
+                  .slice(index + 1)
+                  .some(laterItem => laterItem.type === 'assistant');
                 return (
                   <AssistantMessageItem
                     key={item.message.id}
@@ -1277,6 +1317,8 @@ export const AssistantTurnBlock: React.FC<{
                     resolveLocalFilePath={resolveLocalFilePath}
                     mapDisplayText={mapDisplayText}
                     showCopyButton={showCopyButtons && !hasToolGroupAfter}
+                    showResendButton={isLastTurn && isLastAssistant && showCopyButtons}
+                    onResend={onResend}
                   />
                 );
               }
@@ -1337,6 +1379,7 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
   const skills = useSelector((state: RootState) => state.skill.skills);
   const detailRootRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const promptInputRef = useRef<CoworkPromptInputRef>(null);
   const [shouldAutoScroll, setShouldAutoScroll] = useState(true);
 
   // Clear lazy-render height cache when session changes
@@ -1860,6 +1903,33 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
   const displayItems = useMemo(() => messages ? buildDisplayItems(messages) : [], [messages]);
   const turns = useMemo(() => buildConversationTurns(displayItems), [displayItems]);
 
+
+  // ── Resend / Edit last user message ─────────────────────────────────────────
+
+  /** Resend: delete user message + all after it, then immediately re-submit same content. */
+  const handleResendMessage = useCallback(async (message: CoworkMessage) => {
+    if (!currentSession?.id) return;
+    const content = message.content?.trim() ?? '';
+    if (!content) return;
+    await window.electron.cowork.deleteMessageFrom(currentSession.id, message.id);
+    // Reload session from DB so UI removes deleted messages
+    await coworkService.loadSession(currentSession.id);
+    onContinue(content);
+  }, [currentSession?.id, onContinue]);
+
+  /** Edit: delete user message + all after it, then fill the input box for user to modify. */
+  const handleEditMessage = useCallback(async (message: CoworkMessage) => {
+    if (!currentSession?.id) return;
+    const content = message.content?.trim() ?? '';
+    await window.electron.cowork.deleteMessageFrom(currentSession.id, message.id);
+    // Reload session from DB so UI removes deleted messages
+    await coworkService.loadSession(currentSession.id);
+    requestAnimationFrame(() => {
+      promptInputRef.current?.setValue(content);
+      promptInputRef.current?.focus();
+    });
+  }, [currentSession?.id, promptInputRef]);
+
   // Cache turn-level DOM elements (data-turn-index, always in DOM even for lazy turns)
   useEffect(() => {
     const container = scrollContainerRef.current;
@@ -1968,7 +2038,12 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
         <LazyRenderTurn key={turn.id} turnId={turn.id} alwaysRender={alwaysRender} data-turn-index={index}>
           {turn.userMessage && (
             <div data-export-role="user-message" {...(userRailIdx >= 0 ? { 'data-rail-index': userRailIdx } : undefined)}>
-              <UserMessageItem message={turn.userMessage} skills={skills} />
+              <UserMessageItem
+                message={turn.userMessage}
+                skills={skills}
+                isLastTurn={isLastTurn && !isStreaming}
+                onEdit={handleEditMessage}
+              />
             </div>
           )}
           {showAssistantBlock && (
@@ -1979,6 +2054,10 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
                 mapDisplayText={mapDisplayText}
                 showTypingIndicator={showTypingIndicator}
                 showCopyButtons={!isStreaming}
+                isLastTurn={isLastTurn && !isStreaming}
+                onResend={isLastTurn && !isStreaming && turn.userMessage
+                  ? () => handleResendMessage(turn.userMessage!)
+                  : undefined}
               />
             </div>
           )}
@@ -2385,6 +2464,7 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
       <div className="p-4 shrink-0">
         <div className="max-w-3xl mx-auto">
           <CoworkPromptInput
+            ref={promptInputRef}
             onSubmit={onContinue}
             onStop={onStop}
             isStreaming={isStreaming}

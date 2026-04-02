@@ -905,6 +905,30 @@ export class CoworkStore {
   }
 
   /**
+   * Delete a message and all messages that come after it (by created_at) in the session.
+   * Used by the "edit / resend last message" feature to truncate conversation history.
+   * Returns the number of messages deleted.
+   */
+  deleteMessageAndAfter(sessionId: string, messageId: string): number {
+    // Find the created_at of the target message first
+    const row = this.getOne<{ created_at: number }>(
+      'SELECT created_at FROM cowork_messages WHERE id = ? AND session_id = ?',
+      [messageId, sessionId],
+    );
+    if (!row) return 0;
+    const createdAt = row.created_at;
+    this.db.run(
+      'DELETE FROM cowork_messages WHERE session_id = ? AND created_at >= ?',
+      [sessionId, createdAt],
+    );
+    const deleted = this.db.getRowsModified?.() ?? 0;
+    if (deleted > 0) {
+      this.saveDb();
+    }
+    return deleted;
+  }
+
+  /**
    * Delete a message from a session.
    * Used by reconciliation to remove duplicate or spurious messages.
    */

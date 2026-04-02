@@ -9,6 +9,8 @@ const translations: Record<LanguageType, Record<string, string>> = {
     // 通用
     save: '保存',
     cancel: '取消',
+    confirm: '确认',
+    resendMessage: '重新回复',
     saving: '保存中...',
     create: '创建',
     clear: '清除',
@@ -1198,6 +1200,8 @@ const translations: Record<LanguageType, Record<string, string>> = {
     // Common
     save: 'Save',
     cancel: 'Cancel',
+    confirm: 'Confirm',
+    resendMessage: 'Resend',
     saving: 'Saving...',
     create: 'Create',
     clear: 'Clear',
